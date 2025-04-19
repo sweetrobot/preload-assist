@@ -1,0 +1,613 @@
+<?php
+/**
+ * Admin Class
+ *
+ * @package    PreloadAssist
+ * @subpackage PreloadAssist/admin
+ */
+
+namespace PreloadAssist\Admin;
+
+use PreloadAssist\Facet_Import_Manager;
+use PreloadAssist\Category_Detector;
+use PreloadAssist\URL_Generator;
+use PreloadAssist\File_Manager;
+use PreloadAssist\Database_Manager;
+
+// Exit if accessed directly.
+if ( ! defined( 'ABSPATH' ) ) {
+    exit;
+}
+
+/**
+ * Admin Class
+ *
+ * Handles all admin-related functionality.
+ */
+class Admin {
+
+    /**
+     * Facet import manager instance.
+     *
+     * @var Facet_Import_Manager
+     */
+    private $facet_manager;
+
+    /**
+     * Category detector instance.
+     *
+     * @var Category_Detector
+     */
+    private $category_detector;
+
+    /**
+     * URL generator instance.
+     *
+     * @var URL_Generator
+     */
+    private $url_generator;
+
+    /**
+     * File manager instance.
+     *
+     * @var File_Manager
+     */
+    private $file_manager;
+
+    /**
+     * Database manager instance.
+     *
+     * @var Database_Manager
+     */
+    private $db_manager;
+
+    /**
+     * Initialize the class.
+     *
+     * @param Facet_Import_Manager $facet_manager      The facet import manager instance.
+     * @param Category_Detector    $category_detector  The category detector instance.
+     * @param URL_Generator        $url_generator      The URL generator instance.
+     * @param File_Manager         $file_manager       The file manager instance.
+     * @param Database_Manager     $db_manager         The database manager instance.
+     */
+    public function __construct($facet_manager, $category_detector, $url_generator, $file_manager, $db_manager) {
+        $this->facet_manager = $facet_manager;
+        $this->category_detector = $category_detector;
+        $this->url_generator = $url_generator;
+        $this->file_manager = $file_manager;
+        $this->db_manager = $db_manager;
+    }
+
+    /**
+     * Initialize hooks and filters.
+     */
+    public function init() {
+        add_action('admin_menu', array($this, 'add_admin_menu'));
+        add_action('admin_enqueue_scripts', array($this, 'enqueue_styles'));
+        add_action('admin_enqueue_scripts', array($this, 'enqueue_scripts'));
+        add_action('wp_ajax_preload_assist_import_facets', array($this, 'ajax_import_facets'));
+        add_action('wp_ajax_preload_assist_sync_categories', array($this, 'ajax_sync_categories'));
+        add_action('wp_ajax_preload_assist_toggle_facet', array($this, 'ajax_toggle_facet'));
+        add_action('wp_ajax_preload_assist_toggle_category', array($this, 'ajax_toggle_category'));
+        add_action('wp_ajax_preload_assist_save_category_settings', array($this, 'ajax_save_category_settings'));
+        add_action('wp_ajax_preload_assist_save_parameter', array($this, 'ajax_save_parameter'));
+        add_action('wp_ajax_preload_assist_delete_parameter', array($this, 'ajax_delete_parameter'));
+        add_action('wp_ajax_preload_assist_generate_urls', array($this, 'ajax_generate_urls'));
+        add_action('wp_ajax_preload_assist_select_file', array($this, 'ajax_select_file'));
+        add_action('wp_ajax_preload_assist_delete_file', array($this, 'ajax_delete_file'));
+        add_action('wp_ajax_preload_assist_get_file_preview', array($this, 'ajax_get_file_preview'));
+        add_action('wp_ajax_preload_assist_export_file', array($this, 'ajax_export_file'));
+        add_action('wp_ajax_preload_assist_toggle_flyingpress_integration', array($this, 'ajax_toggle_flyingpress_integration'));
+        add_action('wp_ajax_preload_assist_trigger_preload', array($this, 'ajax_trigger_preload'));
+        add_action('wp_ajax_preload_assist_cleanup_files', array($this, 'ajax_cleanup_files'));
+    }
+
+    /**
+     * Add admin menu pages.
+     */
+    public function add_admin_menu() {
+        add_menu_page(
+            __('Preload Assist', 'preload-assist'),
+            __('Preload Assist', 'preload-assist'),
+            'manage_options',
+            'preload-assist',
+            array($this, 'render_admin_page'),
+            'dashicons-update',
+            30
+        );
+    }
+
+    /**
+     * Enqueue admin styles.
+     *
+     * @param string $hook_suffix The current admin page.
+     */
+    public function enqueue_styles($hook_suffix) {
+        if ('toplevel_page_preload-assist' !== $hook_suffix) {
+            return;
+        }
+
+        wp_enqueue_style(
+            'preload-assist-admin',
+            PRELOAD_ASSIST_PLUGIN_URL . 'admin/css/admin.css',
+            array(),
+            PRELOAD_ASSIST_VERSION
+        );
+    }
+
+    /**
+     * Enqueue admin scripts.
+     *
+     * @param string $hook_suffix The current admin page.
+     */
+    public function enqueue_scripts($hook_suffix) {
+        if ('toplevel_page_preload-assist' !== $hook_suffix) {
+            return;
+        }
+
+        wp_enqueue_script(
+            'preload-assist-admin',
+            PRELOAD_ASSIST_PLUGIN_URL . 'admin/js/admin.js',
+            array('jquery', 'jquery-ui-accordion', 'jquery-ui-tabs', 'wp-util'),
+            PRELOAD_ASSIST_VERSION,
+            true
+        );
+
+        wp_localize_script(
+            'preload-assist-admin',
+            'preloadAssist',
+            array(
+                'ajaxUrl' => admin_url('admin-ajax.php'),
+                'nonce' => wp_create_nonce('preload_assist_nonce'),
+                'i18n' => array(
+                    'syncingFacets' => __('Syncing facets...', 'preload-assist'),
+                    'syncingCategories' => __('Syncing categories...', 'preload-assist'),
+                    'generatingUrls' => __('Generating URLs...', 'preload-assist'),
+                    'selectingFile' => __('Selecting file...', 'preload-assist'),
+                    'deletingFile' => __('Deleting file...', 'preload-assist'),
+                    'loadingPreview' => __('Loading preview...', 'preload-assist'),
+                    'exportingFile' => __('Preparing export...', 'preload-assist'),
+                    'triggeringPreload' => __('Triggering preload...', 'preload-assist'),
+                    'cleaningFiles' => __('Cleaning up files...', 'preload-assist'),
+                    'savingSettings' => __('Saving settings...', 'preload-assist'),
+                    'settingsSaved' => __('Settings saved', 'preload-assist'),
+                    'errorOccurred' => __('An error occurred', 'preload-assist'),
+                    'confirm' => __('Are you sure?', 'preload-assist'),
+                    'confirmDeleteAll' => __('Are you sure you want to delete all plugin data? This cannot be undone.', 'preload-assist')
+                )
+            )
+        );
+    }
+
+    /**
+     * Render admin page.
+     */
+    public function render_admin_page() {
+        include PRELOAD_ASSIST_PLUGIN_DIR . 'admin/views/main.php';
+    }
+
+    /**
+     * AJAX: Import facets from FacetWP export.
+     */
+    public function ajax_import_facets() {
+        check_ajax_referer('preload_assist_nonce', 'nonce');
+
+        if (!current_user_can('manage_options')) {
+            wp_send_json_error(array('message' => __('Permission denied.', 'preload-assist')));
+        }
+
+        $json_string = isset($_POST['json_string']) ? stripslashes($_POST['json_string']) : '';
+
+        if (empty($json_string)) {
+            wp_send_json_error(array('message' => __('FacetWP export string is required.', 'preload-assist')));
+        }
+
+        $result = $this->facet_detector->import_facets($json_string);
+
+        if (in_array($result['status'], ['success', 'partial'])) {
+            $facets = $this->facet_detector->get_facets_with_values();
+            wp_send_json_success(array(
+                'facets' => $facets,
+                'message' => $result['message'],
+                'errors' => !empty($result['errors']) ? $result['errors'] : []
+            ));
+        } else {
+            wp_send_json_error(array('message' => $result['message']));
+        }
+    }
+
+    /**
+     * AJAX: Sync categories.
+     */
+    public function ajax_sync_categories() {
+        check_ajax_referer('preload_assist_nonce', 'nonce');
+
+        if (!current_user_can('manage_options')) {
+            wp_send_json_error(array('message' => __('Permission denied.', 'preload-assist')));
+        }
+
+        $success = $this->category_detector->sync_categories();
+
+        if ($success) {
+            $categories = $this->category_detector->get_hierarchical_categories();
+            wp_send_json_success(array('categories' => $categories));
+        } else {
+            wp_send_json_error(array('message' => __('Failed to sync categories.', 'preload-assist')));
+        }
+    }
+
+    /**
+     * AJAX: Toggle facet.
+     */
+    public function ajax_toggle_facet() {
+        check_ajax_referer('preload_assist_nonce', 'nonce');
+
+        if (!current_user_can('manage_options')) {
+            wp_send_json_error(array('message' => __('Permission denied.', 'preload-assist')));
+        }
+
+        $facet_name = isset($_POST['facet_name']) ? sanitize_text_field($_POST['facet_name']) : '';
+        $enabled = isset($_POST['enabled']) ? (bool) $_POST['enabled'] : false;
+
+        if (empty($facet_name)) {
+            wp_send_json_error(array('message' => __('Invalid facet name.', 'preload-assist')));
+        }
+
+        if ($enabled) {
+            $success = $this->facet_detector->enable_facet($facet_name);
+        } else {
+            $success = $this->facet_detector->disable_facet($facet_name);
+        }
+
+        if ($success) {
+            wp_send_json_success();
+        } else {
+            wp_send_json_error(array('message' => __('Failed to update facet.', 'preload-assist')));
+        }
+    }
+
+    /**
+     * AJAX: Toggle category.
+     */
+    public function ajax_toggle_category() {
+        check_ajax_referer('preload_assist_nonce', 'nonce');
+
+        if (!current_user_can('manage_options')) {
+            wp_send_json_error(array('message' => __('Permission denied.', 'preload-assist')));
+        }
+
+        $category_id = isset($_POST['category_id']) ? intval($_POST['category_id']) : 0;
+        $enabled = isset($_POST['enabled']) ? (bool) $_POST['enabled'] : false;
+
+        if (empty($category_id)) {
+            wp_send_json_error(array('message' => __('Invalid category ID.', 'preload-assist')));
+        }
+
+        if ($enabled) {
+            $success = $this->category_detector->enable_category($category_id);
+        } else {
+            $success = $this->category_detector->disable_category($category_id);
+        }
+
+        if ($success) {
+            wp_send_json_success();
+        } else {
+            wp_send_json_error(array('message' => __('Failed to update category.', 'preload-assist')));
+        }
+    }
+
+    /**
+     * AJAX: Save category settings.
+     */
+    public function ajax_save_category_settings() {
+        check_ajax_referer('preload_assist_nonce', 'nonce');
+
+        if (!current_user_can('manage_options')) {
+            wp_send_json_error(array('message' => __('Permission denied.', 'preload-assist')));
+        }
+
+        $category_id = isset($_POST['category_id']) ? intval($_POST['category_id']) : 0;
+        $settings = isset($_POST['settings']) ? json_decode(stripslashes($_POST['settings']), true) : array();
+
+        if (empty($category_id)) {
+            wp_send_json_error(array('message' => __('Invalid category ID.', 'preload-assist')));
+        }
+
+        $category = $this->category_detector->get_category($category_id);
+
+        if (!$category) {
+            wp_send_json_error(array('message' => __('Category not found.', 'preload-assist')));
+        }
+
+        $success = $this->db_manager->save_category($category_id, $category['is_enabled'], $settings);
+
+        if ($success) {
+            wp_send_json_success();
+        } else {
+            wp_send_json_error(array('message' => __('Failed to save category settings.', 'preload-assist')));
+        }
+    }
+
+    /**
+     * AJAX: Save parameter.
+     */
+    public function ajax_save_parameter() {
+        check_ajax_referer('preload_assist_nonce', 'nonce');
+
+        if (!current_user_can('manage_options')) {
+            wp_send_json_error(array('message' => __('Permission denied.', 'preload-assist')));
+        }
+
+        $param_name = isset($_POST['param_name']) ? sanitize_text_field($_POST['param_name']) : '';
+        $param_values = isset($_POST['param_values']) ? json_decode(stripslashes($_POST['param_values']), true) : array();
+        $enabled = isset($_POST['enabled']) ? (bool) $_POST['enabled'] : false;
+
+        if (empty($param_name)) {
+            wp_send_json_error(array('message' => __('Parameter name is required.', 'preload-assist')));
+        }
+
+        if (empty($param_values)) {
+            wp_send_json_error(array('message' => __('At least one parameter value is required.', 'preload-assist')));
+        }
+
+        $success = $this->db_manager->save_parameter($param_name, $param_values, $enabled);
+
+        if ($success) {
+            $parameters = $this->db_manager->get_enabled_parameters();
+            wp_send_json_success(array('parameters' => $parameters));
+        } else {
+            wp_send_json_error(array('message' => __('Failed to save parameter.', 'preload-assist')));
+        }
+    }
+
+    /**
+     * AJAX: Delete parameter.
+     */
+    public function ajax_delete_parameter() {
+        check_ajax_referer('preload_assist_nonce', 'nonce');
+
+        if (!current_user_can('manage_options')) {
+            wp_send_json_error(array('message' => __('Permission denied.', 'preload-assist')));
+        }
+
+        $param_name = isset($_POST['param_name']) ? sanitize_text_field($_POST['param_name']) : '';
+
+        if (empty($param_name)) {
+            wp_send_json_error(array('message' => __('Parameter name is required.', 'preload-assist')));
+        }
+
+        global $wpdb;
+        $table = $this->db_manager->get_table('parameters');
+
+        if (!$table) {
+            wp_send_json_error(array('message' => __('Database table not found.', 'preload-assist')));
+        }
+
+        $success = $wpdb->delete($table, array('param_name' => $param_name));
+
+        if ($success) {
+            $parameters = $this->db_manager->get_enabled_parameters();
+            wp_send_json_success(array('parameters' => $parameters));
+        } else {
+            wp_send_json_error(array('message' => __('Failed to delete parameter.', 'preload-assist')));
+        }
+    }
+
+    /**
+     * AJAX: Generate URLs.
+     */
+    public function ajax_generate_urls() {
+        check_ajax_referer('preload_assist_nonce', 'nonce');
+
+        if (!current_user_can('manage_options')) {
+            wp_send_json_error(array('message' => __('Permission denied.', 'preload-assist')));
+        }
+
+        $options = array(
+            'max_urls' => isset($_POST['max_urls']) ? intval($_POST['max_urls']) : 10000,
+            'include_empty' => isset($_POST['include_empty']) ? (bool) $_POST['include_empty'] : false,
+            'categories' => isset($_POST['categories']) ? array_map('intval', $_POST['categories']) : array(),
+            'facets' => isset($_POST['facets']) ? array_map('sanitize_text_field', $_POST['facets']) : array(),
+            'parameters' => isset($_POST['parameters']) ? array_map('sanitize_text_field', $_POST['parameters']) : array()
+        );
+
+        $result = $this->url_generator->generate_and_save_urls($options);
+
+        if (is_wp_error($result)) {
+            wp_send_json_error(array('message' => $result->get_error_message()));
+        } else {
+            $files = $this->file_manager->get_files();
+            wp_send_json_success(array(
+                'result' => $result,
+                'files' => $files
+            ));
+        }
+    }
+
+    /**
+     * AJAX: Select file.
+     */
+    public function ajax_select_file() {
+        check_ajax_referer('preload_assist_nonce', 'nonce');
+
+        if (!current_user_can('manage_options')) {
+            wp_send_json_error(array('message' => __('Permission denied.', 'preload-assist')));
+        }
+
+        $file_id = isset($_POST['file_id']) ? intval($_POST['file_id']) : 0;
+
+        if (empty($file_id)) {
+            wp_send_json_error(array('message' => __('Invalid file ID.', 'preload-assist')));
+        }
+
+        $success = $this->file_manager->select_file($file_id);
+
+        if ($success) {
+            $files = $this->file_manager->get_files();
+            wp_send_json_success(array('files' => $files));
+        } else {
+            wp_send_json_error(array('message' => __('Failed to select file.', 'preload-assist')));
+        }
+    }
+
+    /**
+     * AJAX: Delete file.
+     */
+    public function ajax_delete_file() {
+        check_ajax_referer('preload_assist_nonce', 'nonce');
+
+        if (!current_user_can('manage_options')) {
+            wp_send_json_error(array('message' => __('Permission denied.', 'preload-assist')));
+        }
+
+        $file_id = isset($_POST['file_id']) ? intval($_POST['file_id']) : 0;
+
+        if (empty($file_id)) {
+            wp_send_json_error(array('message' => __('Invalid file ID.', 'preload-assist')));
+        }
+
+        $success = $this->file_manager->delete_file($file_id);
+
+        if ($success) {
+            $files = $this->file_manager->get_files();
+            wp_send_json_success(array('files' => $files));
+        } else {
+            wp_send_json_error(array('message' => __('Failed to delete file.', 'preload-assist')));
+        }
+    }
+
+    /**
+     * AJAX: Get file preview.
+     */
+    public function ajax_get_file_preview() {
+        check_ajax_referer('preload_assist_nonce', 'nonce');
+
+        if (!current_user_can('manage_options')) {
+            wp_send_json_error(array('message' => __('Permission denied.', 'preload-assist')));
+        }
+
+        $file_id = isset($_POST['file_id']) ? intval($_POST['file_id']) : 0;
+        $limit = isset($_POST['limit']) ? intval($_POST['limit']) : 100;
+        $offset = isset($_POST['offset']) ? intval($_POST['offset']) : 0;
+
+        if (empty($file_id)) {
+            wp_send_json_error(array('message' => __('Invalid file ID.', 'preload-assist')));
+        }
+
+        $file = $this->file_manager->get_file($file_id);
+
+        if (!$file) {
+            wp_send_json_error(array('message' => __('File not found.', 'preload-assist')));
+        }
+
+        $urls = $this->file_manager->get_file_urls($file_id, $limit, $offset);
+        $total = $file['url_count'];
+
+        wp_send_json_success(array(
+            'urls' => $urls,
+            'total' => $total,
+            'file' => $file
+        ));
+    }
+
+    /**
+     * AJAX: Export file.
+     */
+    public function ajax_export_file() {
+        check_ajax_referer('preload_assist_nonce', 'nonce');
+
+        if (!current_user_can('manage_options')) {
+            wp_send_json_error(array('message' => __('Permission denied.', 'preload-assist')));
+        }
+
+        $file_id = isset($_POST['file_id']) ? intval($_POST['file_id']) : 0;
+
+        if (empty($file_id)) {
+            wp_send_json_error(array('message' => __('Invalid file ID.', 'preload-assist')));
+        }
+
+        $result = $this->file_manager->export_file($file_id);
+
+        if (is_wp_error($result)) {
+            wp_send_json_error(array('message' => $result->get_error_message()));
+        } else {
+            wp_send_json_success($result);
+        }
+    }
+
+    /**
+     * AJAX: Toggle FlyingPress integration.
+     */
+    public function ajax_toggle_flyingpress_integration() {
+        check_ajax_referer('preload_assist_nonce', 'nonce');
+
+        if (!current_user_can('manage_options')) {
+            wp_send_json_error(array('message' => __('Permission denied.', 'preload-assist')));
+        }
+
+        $enabled = isset($_POST['enabled']) ? (bool) $_POST['enabled'] : false;
+        
+        // Save the setting
+        $this->db_manager->save_setting('flyingpress_integration_enabled', $enabled);
+        
+        // Check if FlyingPress is active if integration is enabled
+        if ($enabled) {
+            $integrator = new \PreloadAssist\Preload_Integrator($this->file_manager);
+            if (!$integrator->is_flyingpress_active()) {
+                wp_send_json_success(array(
+                    'warning' => __('FlyingPress is not active. Please install and activate FlyingPress to use this feature.', 'preload-assist')
+                ));
+                return;
+            }
+        }
+        
+        wp_send_json_success();
+    }
+
+    /**
+     * AJAX: Trigger preload.
+     */
+    public function ajax_trigger_preload() {
+        check_ajax_referer('preload_assist_nonce', 'nonce');
+
+        if (!current_user_can('manage_options')) {
+            wp_send_json_error(array('message' => __('Permission denied.', 'preload-assist')));
+        }
+
+        // Check if integration is enabled
+        $integration_enabled = $this->db_manager->get_setting('flyingpress_integration_enabled', false);
+        if (!$integration_enabled) {
+            wp_send_json_error(array('message' => __('FlyingPress integration is not enabled.', 'preload-assist')));
+            return;
+        }
+
+        $integrator = new \PreloadAssist\Preload_Integrator($this->file_manager);
+        $result = $integrator->trigger_preload();
+
+        if (is_wp_error($result)) {
+            wp_send_json_error(array('message' => $result->get_error_message()));
+        } else {
+            wp_send_json_success();
+        }
+    }
+
+    /**
+     * AJAX: Cleanup files.
+     */
+    public function ajax_cleanup_files() {
+        check_ajax_referer('preload_assist_nonce', 'nonce');
+
+        if (!current_user_can('manage_options')) {
+            wp_send_json_error(array('message' => __('Permission denied.', 'preload-assist')));
+        }
+
+        $keep_count = isset($_POST['keep_count']) ? intval($_POST['keep_count']) : 5;
+        $deleted = $this->file_manager->cleanup_files($keep_count);
+        $files = $this->file_manager->get_files();
+
+        wp_send_json_success(array(
+            'deleted' => $deleted,
+            'files' => $files
+        ));
+    }
+}

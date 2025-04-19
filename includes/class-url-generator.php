@@ -1,0 +1,508 @@
+<?php
+/**
+ * URL Generator Class
+ *
+ * @package    PreloadAssist
+ * @subpackage PreloadAssist/includes
+ */
+
+namespace PreloadAssist;
+
+// Exit if accessed directly.
+if ( ! defined( 'ABSPATH' ) ) {
+    exit;
+}
+
+/**
+ * URL Generator Class
+ *
+ * Generates URL permutations based on WooCommerce categories,
+ * FacetWP facets, and custom parameters.
+ */
+class URL_Generator {
+
+    /**
+     * Facet import manager instance.
+     *
+     * @var Facet_Import_Manager
+     */
+    private $facet_manager;
+
+    /**
+     * Category detector instance.
+     *
+     * @var Category_Detector
+     */
+    private $category_detector;
+
+    /**
+     * Database manager instance.
+     *
+     * @var Database_Manager
+     */
+    private $db_manager;
+
+    /**
+     * Initialize the class.
+     *
+     * @param Facet_Import_Manager $facet_manager The facet import manager instance.
+     * @param Category_Detector $category_detector The category detector instance.
+     */
+    public function __construct($facet_manager, $category_detector) {
+        $this->facet_manager = $facet_manager;
+        $this->category_detector = $category_detector;
+        $this->db_manager = new Database_Manager();
+    }
+
+    /**
+     * Generate URL permutations.
+     *
+     * @param array $options Generation options.
+     * @return array
+     */
+    public function generate_urls($options = []) {
+        $default_options = [
+            'max_urls' => 10000,
+            'batch_size' => 1000,
+            'categories' => [],
+            'facets' => [],
+            'parameters' => [],
+            'include_empty' => false
+        ];
+        
+        $options = wp_parse_args($options, $default_options);
+        
+        $urls = [];
+        $count = 0;
+        
+        // If no specific categories provided, use all enabled categories
+        if (empty($options['categories'])) {
+            $options['categories'] = array_map(function($category) {
+                return $category['id'];
+            }, $this->category_detector->get_enabled_categories());
+        }
+        
+        // If no specific facets provided, use all enabled facets
+        if (empty($options['facets'])) {
+            $enabled_facets = $this->facet_manager->get_enabled_facets_with_values();
+            $options['facets'] = array_keys($enabled_facets);
+        }
+        
+        // If no specific parameters provided, use all enabled parameters
+        if (empty($options['parameters'])) {
+            $enabled_parameters = $this->db_manager->get_enabled_parameters();
+            $options['parameters'] = array_column($enabled_parameters, 'param_name');
+        }
+        
+        // Process each category
+        foreach ($options['categories'] as $category_id) {
+            $category = $this->category_detector->get_category($category_id);
+            
+            if (!$category || !$category['is_enabled']) {
+                continue;
+            }
+            
+            $base_url = $category['url'];
+            $category_settings = $category['settings'];
+            
+            // Get facets enabled for this category
+            $category_facets = isset($category_settings['facets']) ? $category_settings['facets'] : $options['facets'];
+            
+            // Get parameters enabled for this category
+            $category_parameters = isset($category_settings['parameters']) ? $category_settings['parameters'] : $options['parameters'];
+            
+            // Start with the base URL
+            if ($options['include_empty']) {
+                $urls[] = $base_url;
+                $count++;
+                
+                if ($count >= $options['max_urls']) {
+                    break;
+                }
+            }
+            
+            // Add category ID to options for facet value selection
+            $category_options = $options;
+            $category_options['current_category'] = $category_id;
+            
+            // Generate permutations
+            $this->generate_facet_permutations($urls, $count, $base_url, $category_facets, $category_parameters, $category_options);
+            
+            if ($count >= $options['max_urls']) {
+                break;
+            }
+        }
+        
+        return $urls;
+    }
+
+    /**
+     * Generate facet permutations recursively.
+     *
+     * @param array  $urls The URLs array (passed by reference).
+     * @param int    $count The URL count (passed by reference).
+     * @param string $base_url The base URL.
+     * @param array  $facets The facets to process.
+     * @param array  $parameters The parameters to process.
+     * @param array  $options Generation options.
+     * @param array  $current_params Current parameters.
+     * @param int    $facet_index Current facet index.
+     */
+    private function generate_facet_permutations(&$urls, &$count, $base_url, $facets, $parameters, $options, $current_params = [], $facet_index = 0) {
+        // If we've processed all facets, add parameters
+        if ($facet_index >= count($facets)) {
+            $this->generate_parameter_permutations($urls, $count, $base_url, $parameters, $options, $current_params);
+            return;
+        }
+        
+        $facet_name = $facets[$facet_index];
+        $facet = $this->facet_manager->get_facet($facet_name);
+        
+        // Skip if facet doesn't exist or is not enabled
+        if (!$facet || !$facet['is_enabled']) {
+            $this->generate_facet_permutations($urls, $count, $base_url, $facets, $parameters, $options, $current_params, $facet_index + 1);
+            return;
+        }
+        
+        // Check if we have category-specific selected values for this facet
+        $selected_values = [];
+        $category_id = isset($options['current_category']) ? $options['current_category'] : null;
+        
+        if ($category_id) {
+            $selected_values = $this->db_manager->get_selected_facet_values($category_id, $facet_name);
+        }
+        
+        // If we have selected values and none are selected, skip this facet
+        if (!empty($selected_values) && count($selected_values) === 0) {
+            $this->generate_facet_permutations($urls, $count, $base_url, $facets, $parameters, $options, $current_params, $facet_index + 1);
+            return;
+        }
+        
+        // First, generate URLs without this facet
+        $this->generate_facet_permutations($urls, $count, $base_url, $facets, $parameters, $options, $current_params, $facet_index + 1);
+        
+        // If we've reached the maximum, stop
+        if ($count >= $options['max_urls']) {
+            return;
+        }
+        
+        // Then, generate URLs with each facet value (filtered by selected values if applicable)
+        foreach ($facet['values'] as $value) {
+            // Skip if we have selected values and this one isn't selected
+            if (!empty($selected_values) && !in_array($value, $selected_values)) {
+                continue;
+            }
+            
+            $param_string = $this->facet_manager->get_facet_url_structure($facet_name, $value);
+            $new_params = $current_params;
+            $new_params[$facet_name] = $value;
+            
+            $this->generate_facet_permutations($urls, $count, $base_url, $facets, $parameters, $options, $new_params, $facet_index + 1);
+            
+            // If we've reached the maximum, stop
+            if ($count >= $options['max_urls']) {
+                return;
+            }
+        }
+    }
+
+    /**
+     * Generate parameter permutations recursively.
+     *
+     * @param array  $urls The URLs array (passed by reference).
+     * @param int    $count The URL count (passed by reference).
+     * @param string $base_url The base URL.
+     * @param array  $parameters The parameters to process.
+     * @param array  $options Generation options.
+     * @param array  $facet_params Current facet parameters.
+     * @param array  $current_params Current custom parameters.
+     * @param int    $param_index Current parameter index.
+     */
+    private function generate_parameter_permutations(&$urls, &$count, $base_url, $parameters, $options, $facet_params = [], $current_params = [], $param_index = 0) {
+        // If we've processed all parameters, generate the URL
+        if ($param_index >= count($parameters)) {
+            $all_params = array_merge($facet_params, $current_params);
+            
+            if (!empty($all_params) || $options['include_empty']) {
+                $url = $this->build_url($base_url, $all_params);
+                $urls[] = $url;
+                $count++;
+            }
+            
+            return;
+        }
+        
+        $param_name = $parameters[$param_index];
+        $param = $this->db_manager->get_parameter($param_name);
+        
+        // Skip if parameter doesn't exist or is not enabled
+        if (!$param || !$param['is_enabled']) {
+            $this->generate_parameter_permutations($urls, $count, $base_url, $parameters, $options, $facet_params, $current_params, $param_index + 1);
+            return;
+        }
+        
+        // First, generate URLs without this parameter
+        $this->generate_parameter_permutations($urls, $count, $base_url, $parameters, $options, $facet_params, $current_params, $param_index + 1);
+        
+        // If we've reached the maximum, stop
+        if ($count >= $options['max_urls']) {
+            return;
+        }
+        
+        // Then, generate URLs with each parameter value
+        foreach ($param['param_values'] as $value) {
+            $new_params = $current_params;
+            $new_params[$param_name] = $value;
+            
+            $this->generate_parameter_permutations($urls, $count, $base_url, $parameters, $options, $facet_params, $new_params, $param_index + 1);
+            
+            // If we've reached the maximum, stop
+            if ($count >= $options['max_urls']) {
+                return;
+            }
+        }
+    }
+
+    /**
+     * Build a URL with parameters.
+     *
+     * @param string $base_url The base URL.
+     * @param array  $params The parameters.
+     * @return string
+     */
+    private function build_url($base_url, $params) {
+        if (empty($params)) {
+            return $base_url;
+        }
+        
+        // Sort parameters by position (before/after)
+        $before_params = [];
+        $facet_params = [];
+        $after_params = [];
+        
+        foreach ($params as $key => $value) {
+            $param_string = $this->facet_manager->get_facet_url_structure($key, $value);
+            
+            if ($param_string) {
+                // This is a facet parameter
+                $facet_params[$key] = $value;
+            } else {
+                // This is a custom parameter - check position
+                $param_info = $this->db_manager->get_parameter($key);
+                
+                if ($param_info && isset($param_info['position']) && $param_info['position'] === 'before') {
+                    $before_params[$key] = $value;
+                } else {
+                    $after_params[$key] = $value;
+                }
+            }
+        }
+        
+        // Build query string segments
+        $query_segments = [];
+        
+        // Add "before" parameters
+        foreach ($before_params as $key => $value) {
+            $query_segments[] = urlencode($key) . '=' . urlencode($value);
+        }
+        
+        // Add facet parameters
+        foreach ($facet_params as $key => $value) {
+            $param_string = $this->facet_manager->get_facet_url_structure($key, $value);
+            if ($param_string) {
+                $query_segments[] = $param_string;
+            }
+        }
+        
+        // Add "after" parameters
+        foreach ($after_params as $key => $value) {
+            $query_segments[] = urlencode($key) . '=' . urlencode($value);
+        }
+        
+        $query_string = implode('&', $query_segments);
+        
+        return $base_url . (strpos($base_url, '?') !== false ? '&' : '?') . $query_string;
+    }
+
+    /**
+     * Estimate URL count.
+     *
+     * @param array $options Generation options.
+     * @return int
+     */
+    public function estimate_url_count($options = []) {
+        $default_options = [
+            'categories' => [],
+            'facets' => [],
+            'parameters' => [],
+            'include_empty' => false
+        ];
+        
+        $options = wp_parse_args($options, $default_options);
+        
+        $estimate = 0;
+        
+        // If no specific categories provided, use all enabled categories
+        if (empty($options['categories'])) {
+            $options['categories'] = array_map(function($category) {
+                return $category['id'];
+            }, $this->category_detector->get_enabled_categories());
+        }
+        
+        // If no specific facets provided, use all enabled facets
+        if (empty($options['facets'])) {
+            $enabled_facets = $this->facet_manager->get_enabled_facets_with_values();
+            $options['facets'] = array_keys($enabled_facets);
+        }
+        
+        // If no specific parameters provided, use all enabled parameters
+        if (empty($options['parameters'])) {
+            $enabled_parameters = $this->db_manager->get_enabled_parameters();
+            $options['parameters'] = array_column($enabled_parameters, 'param_name');
+        }
+        
+        $category_count = count($options['categories']);
+        
+        if ($category_count === 0) {
+            return 0;
+        }
+        
+        // Start with one URL per category (base URL)
+        $estimate = $options['include_empty'] ? $category_count : 0;
+        
+        // Calculate permutations for each category
+        foreach ($options['categories'] as $category_id) {
+            $category = $this->category_detector->get_category($category_id);
+            
+            if (!$category || !$category['is_enabled']) {
+                continue;
+            }
+            
+            $category_settings = $category['settings'];
+            
+            // Get facets enabled for this category
+            $category_facets = isset($category_settings['facets']) ? $category_settings['facets'] : $options['facets'];
+            
+            // Get parameters enabled for this category
+            $category_parameters = isset($category_settings['parameters']) ? $category_settings['parameters'] : $options['parameters'];
+            
+            // Calculate facet permutations
+            $facet_combinations = 1;
+            
+            foreach ($category_facets as $facet_name) {
+                $facet = $this->facet_manager->get_facet($facet_name);
+                
+                if (!$facet || !$facet['is_enabled']) {
+                    continue;
+                }
+                
+                $values_count = count($facet['values']);
+                
+                if ($values_count > 0) {
+                    // Add 1 for "no value" option and multiply by current combinations
+                    $facet_combinations *= ($values_count + 1);
+                }
+            }
+            
+            // Calculate parameter permutations
+            $param_combinations = 1;
+            
+            foreach ($category_parameters as $param_name) {
+                $param = $this->db_manager->get_parameter($param_name);
+                
+                if (!$param || !$param['is_enabled']) {
+                    continue;
+                }
+                
+                $values_count = count($param['param_values']);
+                
+                if ($values_count > 0) {
+                    // Add 1 for "no value" option and multiply by current combinations
+                    $param_combinations *= ($values_count + 1);
+                }
+            }
+            
+            // Total permutations for this category
+            $total_combinations = $facet_combinations * $param_combinations;
+            
+            // Subtract 1 if we're not including empty URLs (the case where no facets/params are selected)
+            if (!$options['include_empty']) {
+                $total_combinations--;
+            }
+            
+            $estimate += $total_combinations;
+        }
+        
+        return $estimate;
+    }
+
+    /**
+     * Generate and save URLs to a file.
+     *
+     * @param array $options Generation options.
+     * @return array|WP_Error
+     */
+    public function generate_and_save_urls($options = []) {
+        $default_options = [
+            'max_urls' => 10000,
+            'batch_size' => 1000,
+            'filename' => 'preload-urls-' . date('Y-m-d-H-i-s') . '.txt',
+            'categories' => [],
+            'facets' => [],
+            'parameters' => [],
+            'include_empty' => false
+        ];
+        
+        $options = wp_parse_args($options, $default_options);
+        
+        $upload_dir = wp_upload_dir();
+        $file_dir = $upload_dir['basedir'] . '/preload-assist';
+        $file_path = $file_dir . '/' . $options['filename'];
+        
+        // Ensure directory exists
+        if (!file_exists($file_dir)) {
+            wp_mkdir_p($file_dir);
+        }
+        
+        // Estimate total URLs
+        $estimated_count = $this->estimate_url_count($options);
+        
+        // Cap at max_urls
+        $estimated_count = min($estimated_count, $options['max_urls']);
+        
+        // Generate URLs
+        $urls = $this->generate_urls($options);
+        
+        // Save to file
+        $file = fopen($file_path, 'w');
+        
+        if (!$file) {
+            return new \WP_Error('file_create_error', __('Could not create file', 'preload-assist'));
+        }
+        
+        foreach ($urls as $url) {
+            fwrite($file, $url . PHP_EOL);
+        }
+        
+        fclose($file);
+        
+        // Get file size
+        $file_size = filesize($file_path);
+        
+        // Save file record to database
+        $this->db_manager->save_file(
+            $options['filename'],
+            $file_path,
+            $file_size,
+            count($urls)
+        );
+        
+        return [
+            'filename' => $options['filename'],
+            'path' => $file_path,
+            'size' => $file_size,
+            'url_count' => count($urls),
+            'estimated_count' => $estimated_count
+        ];
+    }
+}
